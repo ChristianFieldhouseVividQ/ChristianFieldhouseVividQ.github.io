@@ -1,0 +1,313 @@
+import React, { useState, useRef, useMemo, useEffect } from 'react';
+import { Camera, Copy, Maximize2, Crosshair, Settings2, Code, ChevronDown } from 'lucide-react';
+
+const App = () => {
+  const [image, setImage] = useState(null);
+  const [renderedImgSize, setRenderedImgSize] = useState({ w: 0, h: 0 });
+  const [isDraggingCalib, setIsDraggingCalib] = useState(false);
+  const [outputType, setOutputType] = useState('float'); // 'float', 'int', 'uint8'
+  const [lutSize, setLutSize] = useState(1024);
+  
+  const [calib, setCalib] = useState({
+    xMin: 10, xMax: 90,
+    yMin: 90, yMax: 10
+  });
+
+  const [scaleValues, setScaleValues] = useState({
+    xMin: 0, xMax: 10,
+    yMin: 0, yMax: 100
+  });
+
+  const [points, setPoints] = useState([]);
+  const [activeTab, setActiveTab] = useState('x-to-y');
+  const imgRef = useRef(null);
+  const fileInputRef = useRef(null);
+
+  const handleImageUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      setImage(event.target.result);
+      setPoints([]); 
+    };
+    reader.readAsDataURL(file);
+  };
+
+  useEffect(() => {
+    if (!imgRef.current) return;
+    const observer = new ResizeObserver((entries) => {
+      if (entries[0]) {
+        const { width, height } = entries[0].contentRect;
+        setRenderedImgSize({ w: width, h: height });
+      }
+    });
+    observer.observe(imgRef.current);
+    return () => observer.disconnect();
+  }, [image]);
+
+  const getValuesFromPixels = (px, py) => {
+    const xMinPx = (calib.xMin / 100) * renderedImgSize.w;
+    const xMaxPx = (calib.xMax / 100) * renderedImgSize.w;
+    const yMinPx = (calib.yMin / 100) * renderedImgSize.h;
+    const yMaxPx = (calib.yMax / 100) * renderedImgSize.h;
+    const xDiff = (xMaxPx - xMinPx) || 1;
+    const yDiff = (yMaxPx - yMinPx) || 1;
+    const x = scaleValues.xMin + (px - xMinPx) * (scaleValues.xMax - scaleValues.xMin) / xDiff;
+    const y = scaleValues.yMin + (py - yMinPx) * (scaleValues.yMax - scaleValues.yMin) / yDiff;
+    return { x, y };
+  };
+
+  const getPixelsFromValues = (x, y) => {
+    const xMinPx = (calib.xMin / 100) * renderedImgSize.w;
+    const xMaxPx = (calib.xMax / 100) * renderedImgSize.w;
+    const yMinPx = (calib.yMin / 100) * renderedImgSize.h;
+    const yMaxPx = (calib.yMax / 100) * renderedImgSize.h;
+
+    const xRange = (scaleValues.xMax - scaleValues.xMin) || 1;
+    const yRange = (scaleValues.yMax - scaleValues.yMin) || 1;
+
+    const px = xMinPx + (x - scaleValues.xMin) * (xMaxPx - xMinPx) / xRange;
+    const py = yMinPx + (y - scaleValues.yMin) * (yMaxPx - yMinPx) / yRange;
+    return { px, py };
+  };
+
+  const formatOutput = (val) => {
+    if (outputType === 'float') return val.toFixed(6);
+    if (outputType === 'uint8') return Math.max(0, Math.min(255, Math.round(val))).toString();
+    return Math.round(val).toString();
+  };
+
+  const interpolate = (pts, pxTarget) => {
+    if (pts.length < 2) return null;
+    const sorted = [...pts].sort((a, b) => a.px - b.px);
+    if (pxTarget < sorted[0].px || pxTarget > sorted[sorted.length - 1].px) return null;
+    for (let i = 0; i < sorted.length - 1; i++) {
+      if (pxTarget >= sorted[i].px && pxTarget <= sorted[i+1].px) {
+        const p1 = sorted[i];
+        const p2 = sorted[i+1];
+        const xDiff = p2.px - p1.px;
+        if (xDiff === 0) return getValuesFromPixels(pxTarget, p1.py);
+        const ratio = (pxTarget - p1.px) / xDiff;
+        const py = p1.py + ratio * (p2.py - p1.py);
+        return getValuesFromPixels(pxTarget, py);
+      }
+    }
+    return null;
+  };
+
+  const luts = useMemo(() => {
+    if (points.length < 2 || renderedImgSize.w === 0) return { x2y: Array(lutSize).fill("0"), y2x: Array(lutSize).fill("0") };
+    
+    const x2y = [];
+    const stepX = (scaleValues.xMax - scaleValues.xMin) / (lutSize - 1);
+    for (let i = 0; i < lutSize; i++) {
+      const xVal = scaleValues.xMin + i * stepX;
+      const { px } = getPixelsFromValues(xVal, 0);
+      const mapped = interpolate(points, px);
+      x2y.push(mapped ? formatOutput(mapped.y) : "0");
+    }
+
+    const y2x = [];
+    const stepY = (scaleValues.yMax - scaleValues.yMin) / (lutSize - 1);
+    const pointsInValueSpace = points.map(p => ({
+      val: getValuesFromPixels(p.px, p.py)
+    })).sort((a, b) => a.val.y - b.val.y);
+
+    for (let i = 0; i < lutSize; i++) {
+      const yVal = scaleValues.yMin + i * stepY;
+      let xRes = "0";
+      for (let j = 0; j < pointsInValueSpace.length - 1; j++) {
+        const p1 = pointsInValueSpace[j].val;
+        const p2 = pointsInValueSpace[j+1].val;
+        if ((yVal >= p1.y && yVal <= p2.y) || (yVal <= p1.y && yVal >= p2.y)) {
+          const vDiff = p2.y - p1.y;
+          if (vDiff === 0) xRes = formatOutput(p1.x);
+          else {
+            const ratio = (yVal - p1.y) / vDiff;
+            xRes = formatOutput(p1.x + ratio * (p2.x - p1.x));
+          }
+          break;
+        }
+      }
+      y2x.push(xRes);
+    }
+    return { x2y, y2x };
+  }, [points, calib, scaleValues, renderedImgSize, outputType, lutSize]);
+
+  const handleImageClick = (e) => {
+    if (isDraggingCalib) return;
+    if (!imgRef.current) return;
+    const rect = imgRef.current.getBoundingClientRect();
+    setPoints([...points, { id: Date.now(), px: e.clientX - rect.left, py: e.clientY - rect.top }]);
+  };
+
+  const copyAsCuda = (data, name) => {
+    const typeStr = outputType === 'float' ? 'float' : outputType === 'uint8' ? 'unsigned char' : 'int';
+    const suffix = outputType === 'float' ? 'f' : '';
+    const values = data.map(v => `${v}${suffix}`).join(', ');
+    const code = `__constant__ ${typeStr} ${name}[${lutSize}] = {\n  ${values}\n};`;
+    const textArea = document.createElement("textarea");
+    textArea.value = code;
+    document.body.appendChild(textArea);
+    textArea.select();
+    document.execCommand('copy');
+    document.body.removeChild(textArea);
+  };
+
+  const startDrag = (e, key) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingCalib(true);
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const startVal = calib[key];
+    const onMove = (moveEvent) => {
+      const dx = ((moveEvent.clientX - startX) / renderedImgSize.w) * 100;
+      const dy = ((moveEvent.clientY - startY) / renderedImgSize.h) * 100;
+      const newVal = Math.max(0, Math.min(100, startVal + (key.startsWith('x') ? dx : dy)));
+      setCalib(prev => ({ ...prev, [key]: newVal }));
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      setTimeout(() => setIsDraggingCalib(false), 50);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  const handleScaleChange = (key, value) => {
+    const num = parseFloat(value);
+    setScaleValues(prev => ({ ...prev, [key]: isNaN(num) ? 0 : num }));
+  };
+
+  return (
+    <div className="flex flex-col h-screen bg-slate-950 text-slate-100 font-sans p-4 overflow-hidden">
+      <header className="flex justify-between items-center mb-4 shrink-0">
+        <h1 className="text-xl font-bold flex items-center gap-2">
+          <Crosshair className="text-blue-400" /> GraphLUT <span className="text-blue-600 font-normal">CUDA Edition</span>
+        </h1>
+        <div className="flex gap-2">
+            <div className="relative group">
+                <select 
+                    value={lutSize} 
+                    onChange={(e) => setLutSize(parseInt(e.target.value))}
+                    className="bg-slate-800 border border-slate-700 rounded-lg px-4 py-2 text-sm appearance-none pr-10 focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer"
+                >
+                    <option value={1024}>1024 entries</option>
+                    <option value={2048}>2048 entries</option>
+                    <option value={4096}>4096 entries</option>
+                </select>
+                <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400" size={16} />
+            </div>
+            <div className="relative group">
+                <select 
+                    value={outputType} 
+                    onChange={(e) => setOutputType(e.target.value)}
+                    className="bg-slate-800 border border-slate-700 rounded-lg px-4 py-2 text-sm appearance-none pr-10 focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer"
+                >
+                    <option value="float">Float</option>
+                    <option value="int">Int</option>
+                    <option value="uint8">UInt8</option>
+                </select>
+                <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400" size={16} />
+            </div>
+            <button onClick={() => fileInputRef.current.click()} className="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded-lg flex items-center gap-2 transition-colors">
+            <Camera size={18} /> Load Image
+            </button>
+        </div>
+        <input ref={fileInputRef} type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
+      </header>
+
+      <div className="flex flex-1 gap-6 min-h-0">
+        <div className="flex-[3] flex flex-col gap-2 min-h-0 bg-slate-900 rounded-xl border border-slate-800 relative">
+          {!image ? (
+            <div className="flex flex-col items-center justify-center h-full text-slate-700">
+              <Maximize2 size={64} className="mb-4 opacity-10" />
+              <p>Upload a graph image to start</p>
+            </div>
+          ) : (
+            <div className="relative w-full h-full flex items-center justify-center p-16 overflow-hidden">
+              <div className="relative inline-block border border-slate-700 bg-black cursor-crosshair" onClick={handleImageClick}>
+                <img ref={imgRef} src={image} alt="Graph" className="max-h-[70vh] max-w-full block pointer-events-none select-none" />
+                <svg className="absolute inset-0 w-full h-full pointer-events-none overflow-visible">
+                  <line x1={`${calib.xMin}%`} y1="0" x2={`${calib.xMin}%`} y2="100%" stroke="#eab308" strokeWidth="1" strokeDasharray="4 4" />
+                  <line x1={`${calib.xMax}%`} y1="0" x2={`${calib.xMax}%`} y2="100%" stroke="#eab308" strokeWidth="1" strokeDasharray="4 4" />
+                  <line x1="0" y1={`${calib.yMin}%`} x2="100%" y2={`${calib.yMin}%`} stroke="#eab308" strokeWidth="1" strokeDasharray="4 4" />
+                  <line x1="0" y1={`${calib.yMax}%`} x2="100%" y2={`${calib.yMax}%`} stroke="#eab308" strokeWidth="1" strokeDasharray="4 4" />
+                  {points.length > 1 && (
+                    <polyline points={points.slice().sort((a,b)=>a.px-b.px).map(p => `${p.px},${p.py}`).join(' ')} fill="none" stroke="#60a5fa" strokeWidth="2.5" />
+                  )}
+                </svg>
+                <div onMouseDown={(e) => startDrag(e, 'xMin')} className="absolute top-[-12px] w-7 h-7 bg-yellow-500 rounded-full border-2 border-white cursor-ew-resize -translate-x-1/2 flex items-center justify-center shadow-lg z-20 hover:scale-110 active:bg-yellow-400 transition-all" style={{ left: `${calib.xMin}%` }}><span className="text-[10px] text-black font-bold select-none">X1</span></div>
+                <div onMouseDown={(e) => startDrag(e, 'xMax')} className="absolute top-[-12px] w-7 h-7 bg-yellow-500 rounded-full border-2 border-white cursor-ew-resize -translate-x-1/2 flex items-center justify-center shadow-lg z-20 hover:scale-110 active:bg-yellow-400 transition-all" style={{ left: `${calib.xMax}%` }}><span className="text-[10px] text-black font-bold select-none">X2</span></div>
+                <div onMouseDown={(e) => startDrag(e, 'yMin')} className="absolute left-[-12px] w-7 h-7 bg-yellow-500 rounded-full border-2 border-white cursor-ns-resize -translate-y-1/2 flex items-center justify-center shadow-lg z-20 hover:scale-110 active:bg-yellow-400 transition-all" style={{ top: `${calib.yMin}%` }}><span className="text-[10px] text-black font-bold select-none">Y1</span></div>
+                <div onMouseDown={(e) => startDrag(e, 'yMax')} className="absolute left-[-12px] w-7 h-7 bg-yellow-500 rounded-full border-2 border-white cursor-ns-resize -translate-y-1/2 flex items-center justify-center shadow-lg z-20 hover:scale-110 active:bg-yellow-400 transition-all" style={{ top: `${calib.yMax}%` }}><span className="text-[10px] text-black font-bold select-none">Y2</span></div>
+                {points.map(p => (
+                  <div key={p.id} className="absolute w-4 h-4 bg-blue-500 rounded-full -translate-x-1/2 -translate-y-1/2 ring-2 ring-white cursor-pointer z-10 hover:scale-125 active:scale-95 transition-transform shadow-md"
+                    style={{ left: p.px, top: p.py }}
+                    onClick={(e) => { e.stopPropagation(); setPoints(points.filter(pt => pt.id !== p.id)); }}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="w-80 flex flex-col gap-4 overflow-hidden">
+          <div className="bg-slate-900 p-4 rounded-xl border border-slate-800">
+            <h3 className="text-xs font-bold mb-4 flex items-center gap-2 text-slate-400 uppercase tracking-widest"><Settings2 size={14}/> Scale Calibration</h3>
+            <div className="grid grid-cols-2 gap-3 mb-3">
+              <div className="space-y-1">
+                <label className="text-[10px] text-slate-500">X1 (Left Line)</label>
+                <input type="number" value={scaleValues.xMin} onChange={e => handleScaleChange('xMin', e.target.value)} className="w-full bg-slate-800 p-2 rounded text-sm border border-slate-700 focus:border-blue-500 outline-none" />
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] text-slate-500">X2 (Right Line)</label>
+                <input type="number" value={scaleValues.xMax} onChange={e => handleScaleChange('xMax', e.target.value)} className="w-full bg-slate-800 p-2 rounded text-sm border border-slate-700 focus:border-blue-500 outline-none" />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <label className="text-[10px] text-slate-500">Y1 (Lower Line)</label>
+                <input type="number" value={scaleValues.yMin} onChange={e => handleScaleChange('yMin', e.target.value)} className="w-full bg-slate-800 p-2 rounded text-sm border border-slate-700 focus:border-blue-500 outline-none" />
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] text-slate-500">Y2 (Upper Line)</label>
+                <input type="number" value={scaleValues.yMax} onChange={e => handleScaleChange('yMax', e.target.value)} className="w-full bg-slate-800 p-2 rounded text-sm border border-slate-700 focus:border-blue-500 outline-none" />
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-slate-900 rounded-xl border border-slate-800 flex flex-col flex-1 min-h-0 overflow-hidden">
+            <div className="flex text-[11px] border-b border-slate-800">
+              <button onClick={() => setActiveTab('x-to-y')} className={`flex-1 p-3 font-bold transition-colors ${activeTab === 'x-to-y' ? 'text-blue-400 bg-blue-400/5' : 'text-slate-500 hover:bg-slate-800/50'}`}>X → Y</button>
+              <button onClick={() => setActiveTab('y-to-x')} className={`flex-1 p-3 font-bold transition-colors ${activeTab === 'y-to-x' ? 'text-blue-400 bg-blue-400/5' : 'text-slate-500 hover:bg-slate-800/50'}`}>Y → X</button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-3 font-mono text-[10px]">
+              <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
+                {luts[activeTab === 'x-to-y' ? 'x2y' : 'y2x'].map((val, i) => (
+                  <div key={i} className="flex justify-between border-b border-slate-800/50 hover:bg-white/5 px-1">
+                    <span className="opacity-30">[{i}]</span>
+                    <span className="text-blue-300">{val}{outputType === 'float' ? 'f' : ''}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="p-3 border-t border-slate-800 bg-slate-900/50">
+              <button 
+                onClick={() => copyAsCuda(activeTab === 'x-to-y' ? luts.x2y : luts.y2x, activeTab === 'x-to-y' ? 's_lutX2Y' : 's_lutY2X')} 
+                className="w-full bg-blue-600 hover:bg-blue-500 py-3 rounded text-xs font-bold flex items-center justify-center gap-2 shadow-lg transition-all active:scale-95"
+              >
+                <Code size={14}/> Copy CUDA {outputType.toUpperCase()} Array
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default App;

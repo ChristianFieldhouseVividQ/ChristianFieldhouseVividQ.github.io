@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Curve Fitter</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background: #111; color: #eee; overflow: hidden; }
+        canvas { cursor: crosshair; touch-action: none; }
+        .controls { position: absolute; top: 10px; left: 10px; z-index: 10; background: rgba(0,0,0,0.8); padding: 15px; border-radius: 8px; pointer-events: auto; }
+    </style>
+</head>
+<body class="flex flex-col items-center justify-center h-screen">
+
+    <div class="controls border border-gray-700 shadow-xl space-y-3">
+        <h1 class="text-sm font-bold uppercase tracking-widest text-blue-400">Monotonic Power Curve</h1>
+        <input type="file" id="upload" accept="image/*" class="block text-xs text-gray-400 file:mr-4 file:py-1 file:px-2 file:rounded-full file:border-0 file:text-xs file:font-semibold file:bg-blue-600 file:text-white hover:file:bg-blue-500">
+        <div class="text-xs space-y-1">
+            <p id="status">1. Upload Image</p>
+            <p>Exponent (a): <span id="exp-val" class="text-blue-400 font-mono">1.00</span></p>
+        </div>
+        <button id="reset" class="w-full py-1 bg-red-900/50 hover:bg-red-800 text-xs rounded">Clear Points</button>
+    </div>
+
+    <canvas id="canvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const upload = document.getElementById('upload');
+        const status = document.getElementById('status');
+        const expVal = document.getElementById('exp-val');
+        const resetBtn = document.getElementById('reset');
+
+        let img = null;
+        let p1 = null;
+        let p2 = null;
+        let exponent = 1.0;
+        let dragTarget = null;
+        let imgBounds = { x: 0, y: 0, w: 0, h: 0 };
+        const HIT_RADIUS = 15;
+
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            if (img) calculateImgBounds();
+            draw();
+        }
+
+        function calculateImgBounds() {
+            const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
+            imgBounds.w = img.width * scale;
+            imgBounds.h = img.height * scale;
+            imgBounds.x = (canvas.width - imgBounds.w) / 2;
+            imgBounds.y = (canvas.height - imgBounds.h) / 2;
+        }
+
+        window.addEventListener('resize', resize);
+        resize();
+
+        upload.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                const newImg = new Image();
+                newImg.onload = () => {
+                    img = newImg;
+                    p1 = p2 = null;
+                    exponent = 1.0;
+                    expVal.innerText = "1.00";
+                    status.innerText = "2. Click Start Point";
+                    calculateImgBounds();
+                    draw();
+                };
+                newImg.src = event.target.result;
+            };
+            reader.readAsDataURL(file);
+        });
+
+        resetBtn.addEventListener('click', () => {
+            p1 = p2 = null;
+            exponent = 1.0;
+            expVal.innerText = "1.00";
+            status.innerText = img ? "2. Click Start Point" : "1. Upload Image";
+            draw();
+        });
+
+        function getDist(ax, ay, bx, by) {
+            return Math.sqrt((ax - bx) ** 2 + (ay - by) ** 2);
+        }
+
+        canvas.addEventListener('mousedown', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+
+            if (!p1) {
+                p1 = { x, y };
+                status.innerText = "3. Click End Point";
+            } else if (!p2) {
+                p2 = { x, y };
+                status.innerText = "4. Drag curve to adjust 'a'";
+            } else {
+                if (getDist(x, y, p1.x, p1.y) < HIT_RADIUS) {
+                    dragTarget = 'p1';
+                } else if (getDist(x, y, p2.x, p2.y) < HIT_RADIUS) {
+                    dragTarget = 'p2';
+                } else {
+                    dragTarget = 'curve';
+                    updateExponent(x, y);
+                }
+            }
+            draw();
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+
+            if (!dragTarget) return;
+
+            if (dragTarget === 'p1') {
+                p1.x = x; p1.y = y;
+            } else if (dragTarget === 'p2') {
+                p2.x = x; p2.y = y;
+            } else if (dragTarget === 'curve') {
+                updateExponent(x, y);
+            }
+            draw();
+        });
+
+        window.addEventListener('mouseup', () => dragTarget = null);
+
+        function updateExponent(mx, my) {
+            if (!p1 || !p2) return;
+            
+            // Baseline vectors
+            const dx = p2.x - p1.x;
+            const dy = p2.y - p1.y;
+            const L = Math.sqrt(dx*dx + dy*dy);
+            if (L < 5) return;
+
+            const ux = dx / L;
+            const uy = dy / L;
+
+            // Mouse relative to p1
+            const vx = mx - p1.x;
+            const vy = my - p1.y;
+            
+            // x' in [0, 1] along the p1-p2 axis
+            const nx = (vx * ux + vy * uy) / L;
+            // y' (perpendicular displacement)
+            const ny = (vx * (-uy) + vy * ux);
+
+            if (nx <= 0.01 || nx >= 0.99) return;
+
+            // f(x) = c * x^a
+            // In our coordinate system, P2 is at (1, 0) relative to the baseline.
+            // But we want the function height 'c' to be defined by the end point P2.
+            // Let's treat the 'vertical' as the perpendicular offset.
+            // If the user drags to (nx, ny), we solve: ny = c * nx^a
+            // Since P2 is our anchor (1, 0) on the baseline, a pure c*x^a through P2 means c=0.
+            
+            // Re-interpreting: f(x) = c * x^a where c is the "height" of the curve.
+            // To maintain monotonicity and pass through P1(0,0) and P2(1,0) on baseline:
+            // We can't use f(x)=cx^a. 
+            // If you want f(x) = c * x^a, P2 cannot be on the baseline.
+            // Let's assume the "vertical" axis is the y-axis of the screen (or similar).
+            
+            // MATH: Let local X = horizontal distance from P1 normalized by (P2.x - P1.x)
+            // Let local Y = f(x) = (P2.y - P1.y) * x^a
+            
+            const localDX = p2.x - p1.x;
+            const localDY = p2.y - p1.y;
+            
+            const currX = (mx - p1.x) / localDX;
+            const currY = (my - p1.y);
+            
+            if (currX <= 0.01 || currX >= 0.99) return;
+
+            // Solve: currY = localDY * (currX ^ a)
+            // (currX ^ a) = currY / localDY
+            // a = log(currY / localDY) / log(currX)
+            
+            const ratio = currY / localDY;
+            if (ratio > 0) {
+                let a = Math.log(ratio) / Math.log(currX);
+                exponent = Math.max(0.33, Math.min(3.0, a));
+                expVal.innerText = exponent.toFixed(2);
+            }
+        }
+
+        function draw() {
+            ctx.fillStyle = '#111';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            if (img) ctx.drawImage(img, imgBounds.x, imgBounds.y, imgBounds.w, imgBounds.h);
+
+            if (p1 && p2) {
+                const dx = p2.x - p1.x;
+                const dy = p2.y - p1.y;
+
+                ctx.strokeStyle = '#60a5fa';
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.moveTo(p1.x, p1.y);
+
+                const steps = 100;
+                for (let i = 1; i <= steps; i++) {
+                    const t = i / steps;
+                    // f(x) = c * x^a
+                    // x_canvas = p1.x + t * (p2.x - p1.x)
+                    // y_canvas = p1.y + (p2.y - p1.y) * t^a
+                    const px = p1.x + t * dx;
+                    const py = p1.y + Math.pow(t, exponent) * dy;
+                    ctx.lineTo(px, py);
+                }
+                ctx.stroke();
+                
+                // Helper line (straight)
+                ctx.setLineDash([5, 5]);
+                ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+                ctx.beginPath();
+                ctx.moveTo(p1.x, p1.y);
+                ctx.lineTo(p2.x, p2.y);
+                ctx.stroke();
+                ctx.setLineDash([]);
+            }
+
+            if (p1) {
+                ctx.fillStyle = dragTarget === 'p1' ? '#93c5fd' : '#60a5fa';
+                ctx.beginPath(); ctx.arc(p1.x, p1.y, 8, 0, Math.PI * 2); ctx.fill();
+            }
+            if (p2) {
+                ctx.fillStyle = dragTarget === 'p2' ? '#93c5fd' : '#60a5fa';
+                ctx.beginPath(); ctx.arc(p2.x, p2.y, 8, 0, Math.PI * 2); ctx.fill();
+            }
+        }
+    </script>
+</body>
+</html>
